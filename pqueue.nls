@@ -1,0 +1,117 @@
+; This file is the sample code delievered in middfile. It is used as the implementation of priority queue
+; which is the data strucure for the Dijkstra's Algorithm to find shortest path for pedestrians.
+
+; ============ A GENERIC SPECIALIZED PRIORITY QUEUE WITH DECREASE-KEY CAPABILITY =============
+; Priority queue implemented using a (hidden) turtle agent that use three instance variables:
+; data             -- stores the actual values as a standard min binary heap in an array/list
+; compare-task     -- stores the anonymous Boolean report that compares two values 
+; update-pos-task  -- updates the position of a value in the queue, so that it can be found
+;                      if its key needs to be decreased
+
+breed [ priority-queues priority-queue ]
+priority-queues-own [ compare-task update-pos-task data ]
+
+; ============== INTERFACE PROCEDURES AND REPORTERS -- ALL IMPLEMENTED AS OBSERVER CONTEXT ========
+
+; ---------- CONSTRUCTOR ----------
+; Create and report a new empty priority queue, given the compare-task pq-ct, and the update-pos-task ps-upt
+to-report pq-new [ pq-ct ps-upt  ]
+  let return-value nobody             ; create a local variable to store the value to be reported
+  create-priority-queues 1 [          ; create and initialize the priority queue agent to be reported
+    set hidden? true                  ; these are not intended to be seen
+    set compare-task pq-ct            ; initialize the variables from parameters
+    set update-pos-task ps-upt
+    set data []                       ; initially empty priority queue
+    set return-value self
+  ]
+  report return-value
+end
+
+; ----------- insert item x into the given priority queue pq.  
+to pq-insert [ pq x ]
+  ask pq [
+    set data (lput x data)         ; put x at the end of the data list
+    let pos length data - 1        ; local variable to store the initial index in the data list
+    (run update-pos-task x pos)    ; let x store its position the data list
+    pq-bubble pos                  ; bubble the value up to establish the min heap ordering
+  ]
+end
+
+; ----------- report and delete the front item of the priority queue pq.
+to-report pq-delete-front [ pq ]
+  let result [first data] of pq          ; the value to be reported
+  
+  ; to delete the minimum element, copy the last element into the first spot, and then let it sink down the tree
+  ask pq [
+    set data replace-item 0 data (item (length data - 1) data)   ; copy last element to first position
+    set data but-last data                                       ; delete the last item that was copied
+    if length data > 0 [                                         ; if the heap is not empty, update the ordering
+      (run update-pos-task (first data) 0)                       ; update the position of the new first time
+      pq-sink 0                                                  ; sink the new item at the root down into the tree
+    ]
+  ]
+  report result                                                  ; report the minimum value that was extracted
+end
+
+; report true of the priority queue pq is empty 
+to-report pq-empty? [ pq ]
+  report length ([data] of pq) = 0 
+end
+
+
+; ==================  INTERNAL PROCEDURES called by a PRIORITY QUEUE to perform High Level Operations on DATA
+; ==================: i.e. These are all PRIORITY_QUEUE Context  =============
+
+
+; Let the element at index n in the data array of self (the priority queue calling this procedure) bubble
+; up the tree until it has a parent that has a smaller value than itself, or until it becomes the root
+to pq-bubble [ n ]
+  ; If the object at index n is not the root and its parent is larger, bubble it upward
+  while [ n > 0 and (run-result compare-task (item n data) (item (pq-parent n) data)) ][
+    pq-swap n (pq-parent n)
+    set n (pq-parent n)
+  ]
+end
+
+; Let the element at index n in the data array of self (the priority queue calling this procedure) sink
+; down the tree until both children are larger than self, or until it becomes a leaf
+to pq-sink [ n ]
+  let lc pq-lchild n         ; index of left child
+  if lc < length data [
+    let sc lc
+    let rc pq-rchild n
+    if rc < length data and (run-result compare-task (item rc data)(item sc data)) [set sc rc]
+    if (run-result compare-task (item sc data) (item n data))[
+      pq-swap sc n 
+      pq-sink sc 
+    ]
+  ]
+end
+
+; swap items at indices i and j in the data list
+to pq-swap [i j ]
+  let temp item i data
+  set data replace-item i data item j data
+  set data replace-item j data temp
+  
+  ; update the positions of these items to be their new positions
+  (run update-pos-task (item i data) i)
+  (run update-pos-task (item j data) j)
+end
+
+
+
+; ==== Low level HELPER REPORTERS to report indices of the parent, left child, and right child of a node in the tree ===
+; Although called by a priority queue, in theory, these are all observer context as they are simply numerical functions on integers
+; The return the index of the parent, left child, and right child of the value at the given index n
+to-report pq-parent [n]
+  report int ((n - 1) / 2)
+end
+
+to-report pq-lchild [n]
+  report 2 * n + 1
+end
+
+to-report pq-rchild [n]
+  report 2 * n + 2
+end
