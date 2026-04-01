@@ -16,7 +16,7 @@ Beyond the immediate campus application, the model demonstrates a generalizable 
 
 ## Overview
 
-CampusWalk is a spatially explicit agent-based model (ABM) built in **NetLogo 7.0** that simulates pedestrian route-choice behavior on a real campus pedestrian movement network under winter conditions. The model investigates a core question in complex systems research: **how do simple, local decisions made by individual agents produce complex system-level patterns — and how can institutional interventions reshape those patterns?**
+This is a spatially explicit agent-based model (ABM) built in **NetLogo 7.0** that simulates pedestrian route-choice behavior on a real campus pedestrian movement network under winter conditions. The model investigates a core question in complex systems research: **how do simple, local decisions made by individual agents produce complex system-level patterns — and how can institutional interventions reshape those patterns?**
 
 Rather than imposing top-down equations to describe aggregate pedestrian flow, this model takes a bottom-up approach. Each pedestrian agent independently plans routes using Dijkstra's shortest-path algorithm, adapts to local snow conditions through probabilistic rerouting, and collectively generates emergent walkability patterns across the network. Snow-plow agents then introduce a second layer of complexity by following configurable clearing strategies, allowing the researcher to observe how maintenance interventions interact with organic pedestrian behavior.
 
