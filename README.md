@@ -1,0 +1,2 @@
+# Agent-Based-Simulation-of-Campus-Pedestrian-Movement-Network-Under-Winter-Conditions
+Agent-based model simulating pedestrian movement on a campus road network under winter conditions. Pedestrians plan shortest paths via Dijkstra's algorithm and adaptively reroute based on snow and walkability. Snow plows follow configurable strategies to clear roads. Built in NetLogo, ready for real-world experimentation with custom graphs and data
