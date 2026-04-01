@@ -1,9 +1,5 @@
 # ❄️ Agent-Based Simulation of Campus Pedestrian Movement Network Under Winter Conditions
 
-<p align="center">
-  <img src="campus_map.png" alt="Middlebury College Campus Map with Node-Link Graph Overlay" width="700"/>
-</p>
-
 > **An agent-based model exploring how decentralized pedestrian decisions and snow-plow strategies shape emergent walkability patterns across a campus pedestrian movement network.**
 
 ---
