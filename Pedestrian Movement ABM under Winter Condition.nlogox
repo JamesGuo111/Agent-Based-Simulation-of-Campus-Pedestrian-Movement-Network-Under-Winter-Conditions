@@ -1,0 +1,1840 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.3" snapToGrid="false">
+  <code><![CDATA[; Term Project
+; Zijing Guo
+; January 31, 2026
+
+__includes ["pqueue.nls"]
+
+breed [pedestrians pedestrian]
+breed [nodes node]
+breed [plows plow]
+
+pedestrians-own [
+  current-node                   ; store the current node pedestrians are on
+  prev-node                      ; store the previous node pedestrians were on, uesd for not going back when randomly selecting next
+  final-destination              ; the final building node pedestrians choose to go
+  temp-destination               ; the temporary road/building node pedestrians are heading to
+  route                          ; a list storing the shortest path from starting point to final destination
+  route-index                    ; the index keep track of which part of the shortest path the pedestrian has reached
+  need-reroute-on                ; stores the starting node to be rerouted from, this happens when the snow on the original road in the shortest path caused the pedestrian to select another road
+                                 ; this variable is created mainly because of user context issue, see explanation in the move-pedestrian procedure.
+  walking-time                   ; this variable records the length of time the pedestrian has been on the road yet still not reaching its destination.
+]
+
+nodes-own [
+  node-type                       ; there are two types of node: building and road
+  building-type                   ; for building node, what's the type of the building (Academic, Dining, Residential, Other). For road node, this would be "None"
+  acc_dist                        ; this variable is used to store the accumulated distance for the Dijkstra's Algorithm when finding the shortest path for a pedestrian.
+  parent                          ; stores the parent that adds it into the priority queue, used for the reconstructing path process for the searching algorithm
+  pq-pos                          ; position index in the priority queue
+  node-id                         ; for the file writing part to store the node-link graph already created, which needs a unique id for each node.
+]
+
+links-own [
+  snow?                           ; boolean var to determine whether there's snow on the road
+  walkability                     ; number of times pedestrians have walked on the road. When there's snow, higher walkability means more people have walked on the road to make it easier to walk.
+  len                             ; = link-length for the searching algorithm
+]
+
+plows-own [
+  current-node                    ; current position of the plow
+  temp-destination                ; to store the next destination
+]
+
+globals [
+  click-radius                    ; radius range for mouse to detect a node
+  default-size                    ; default size of node when not pointed
+  default-color-building          ; default color of building node, set to be orange (more noticeable)
+  default-color-road              ; default color of road node, set to be black
+  high-size                       ; when highlighted with mouse pointing on the point, change the size so that user knows
+  high-color                      ; change to this color when mouse pointing
+  ; building-type-to-make          ---- interface variable based on the chooser, used when creating a building node, assign the building type
+  p-origin-academic               ; probability for academic building to generate pedestrians
+  p-origin-dining                 ; probability for dining building to generate pedestrians
+  p-origin-residential            ; probability for residential building to generate pedestrians
+  p-origin-other                  ; probability for other building to generate pedestrians
+  p-dest-academic                 ; probability for academic building to be set as final destination by pedestrians
+  p-dest-dining                   ; probability for dining building to be set as final destination by pedestrians
+  p-dest-residential              ; probability for residential building to be set as final destination by pedestrians
+  p-dest-other                    ; probability for other building to be set as final destination by pedestrians
+  average-walking-time            ; store the total walking time of all pedestrians divided by number of pedestrian
+  ; num-ped                        ---- interface var: number of pedestrian, default 100
+  ; speed-ped                      ---- interface var: moving speed of pedestrian, default 10
+  ; reroute-p-when-snow            ---- interface var: probability to switch to a more walkable road when there's snow on the current one, default 0.3
+  ; faster-threshold               ---- interface var: the threshold of walkability after which pedestrian can move faster if they choose to walk on such road. default 200
+  ; speed-snow                     ---- interface var: the pedestrian speed when walking on snowy road, default 5
+  ; speed-walkable-snow            ---- interface var: the pedestrian speed when walking on snowy road with walkability higher than the threshold, default 7
+  ; num-plow                       ---- interface var: the number of plows on campus
+  ; speed-plow                     ---- interface var: the speed of the plows
+  ; snowed?                        ---- interface var: switch variable to set whether in snowed setting
+  ; plow-strategy                  ---- interface var: the plow movement strategy, in string
+  
+  next-node-id                    ; for file writing function, store the next node id so that when previous nodes-links graph are loaded, user can still create new node/path following the id.
+]
+
+to setup
+  clear-all
+  import-drawing "campus_map.png"
+  load-graph "complete-graph"
+  set next-node-id 0
+  set click-radius 10
+  set high-size 20
+  set default-size 10
+  set default-color-road black
+  set default-color-building orange
+  set high-color red
+  set p-origin-academic 0.3
+  set p-origin-dining 0.3
+  set p-origin-residential 0.3
+  set p-origin-other 0.1
+  set p-dest-academic 0.3
+  set p-dest-dining 0.3
+  set p-dest-residential 0.3
+  set p-dest-other 0.1
+  load-graph "complete-graph"
+  reset-ticks
+end
+
+; this procedure would be more frequently used to set up new model because it does not clear-all, which is important because
+; clear-all will remove the node-links graph and the user has to import again.
+to reset-simulation
+  ask pedestrians [die]
+  ask plows [die]
+  reset-ticks
+  clear-plot
+  ; based on users choices, set up different form of simulation
+  ifelse snowed? [
+    ask links [set snow? true set walkability 0 set color blue]
+  ][
+    ask links [set snow? false set walkability 0 set color yellow]
+  ]
+end
+
+to go
+  generate-pedestrians
+  move-pedestrians
+  move-plow
+  if ticks = 2000 [if snow-plow? [generate-plow]] ; after 2000 ticks, generate plow. This is to make sure that original pattern is formed, then add plow to see how the patterns can be altered.
+  ask pedestrians [set walking-time walking-time + 1]
+  if show-walkability? [
+    ask pedestrians [set hidden? true]
+    update-link-visual
+  ]
+  set average-walking-time sum [walking-time] of pedestrians / num-ped
+  tick
+end
+
+
+; ------------------------------------------ Basic Setup Tools ---------------------------------------
+
+; this code is partially based on the "middtraffic" file delivered
+; make nodes interactive with users through mouse movement
+; Observer Context
+to highlight
+  ask nodes [
+    ifelse distancexy mouse-xcor mouse-ycor <= click-radius [
+      set size high-size
+      set color high-color
+    ][
+      set size default-size
+      ifelse node-type = "building" [
+        set color default-color-building
+      ][
+        set color default-color-road]
+    ]
+  ]
+end
+
+; Observer Context
+; implement the interactive features while making graph and report the position of mouse pointing.
+to-report get-mouse-click
+  while [not mouse-down?][highlight]
+  while [mouse-down?][highlight]
+  report (list mouse-xcor mouse-ycor)
+end
+
+; Observer Context
+; report the node within the clicked position
+to-report get-node
+  let to-return nobody
+  while [to-return = nobody] [
+    let loc get-mouse-click
+    ; loc is a list [x y]
+    let x first loc
+    let y last loc
+    if any? nodes with [distancexy x y < click-radius][
+      set to-return min-one-of nodes [distancexy x y]
+    ]
+  ]
+  report to-return
+end
+
+; Observer Context
+; draw a building node on the graph with selected building type
+to make-building-node
+  let loc get-mouse-click
+  let x first loc
+  let y last loc
+  if not any? nodes with [distancexy x y < click-radius][ ; if a node already exists in the range, no new node will be created
+    create-nodes 1[
+      setxy x y
+      set shape "circle"
+      set color default-color-building
+      set size default-size
+      set node-type "building"
+      set building-type building-type-to-make ; determined by the chooser in the interface
+      set node-id next-node-id ; always keep track of this whenever a new node is created.
+      set next-node-id next-node-id + 1
+    ]
+  ]
+  ; restore all nodes to their normal states
+  ; in some cases nodes may be kpet in highlighted form, which is not desired.
+  ask nodes [
+    set size default-size
+    ifelse node-type = "building" [
+      set color default-color-building
+    ][set color default-color-road]
+  ]  
+end
+
+; Observer Context
+; draw a road node on the graph
+to make-road-node
+  let loc get-mouse-click
+  let x first loc
+  let y last loc 
+  if not any? nodes with [distancexy x y < click-radius][ ; if a node already exists, won't create a new one
+    create-nodes 1[
+      setxy x y
+      set shape "circle"
+      set color default-color-road
+      set size default-size
+      set node-type "road"
+      set building-type "None"
+      set node-id next-node-id
+      set next-node-id next-node-id + 1
+    ]
+  ]
+  ; restore the nodes to their normal states
+  ask nodes [
+    set size default-size
+    ifelse node-type = "building" [
+      set color default-color-building
+    ][set color default-color-road]
+  ]  
+end
+
+; Observer Context
+; Select two nodes and build an undirected link representing path between them
+to make-path
+  if count nodes > 1 [ ; only when there are more than 1 node can a path be created
+    let node1 get-node
+    let node2 get-node
+    if node1 != node2 [
+      ask node1 [
+        create-link-with node2 [set thickness 5 
+          set color yellow 
+          set len link-length
+          set snow? false
+          set walkability 0
+        ]
+      ]
+    ]
+  ]
+  ; restore all nodes to their normal states
+  ask nodes [
+    set size default-size
+    ifelse node-type = "building" [
+      set color default-color-building
+    ][set color default-color-road]
+  ] 
+end
+
+; Observer Context
+; Select two nodes and delete the path between them. This is for the convenience of user when creating path, in case user makes mistakes.
+to delete-path
+  if count links != 0 [ ; only when there is at least one path can the method be called.
+    let node1 get-node
+    let node2 get-node
+    if node1 != node2 [
+      ask node1 [
+        let path link-with node2
+        if path != nobody [ask path [die]]
+      ]
+    ]
+  ]
+  ; restore all nodes to their normal states
+  ask nodes [
+    set size default-size
+    ifelse node-type = "building" [
+      set color default-color-building
+    ][set color default-color-road]
+  ] 
+end
+
+; Observer Context
+; Delete the selected node for the convenience of user in case the wrongly created a node.
+to delete-node
+  if count nodes != 0 [ ; only when there is node can the method be used.
+    let to-delete get-node
+    ask to-delete [die]
+  ]
+  ; restore all nodes to their normal states
+  ask nodes [
+    set size default-size
+    ifelse node-type = "building" [
+      set color default-color-building
+    ][set color default-color-road]
+  ] 
+end
+
+; ------------------------------------- Graph Storage -----------------------------------
+; Observer Context
+; This procedure stores the node-link graph drawn by users to an external text file, 
+; so that later when other users use this model, they can directly load the graph through load-graph.
+to save-graph
+  let f user-new-file
+  if f = false [stop] ; if the user presses cancels and does not pick any file, then stop the procedure.
+  
+  file-close-all
+  file-open f
+  
+  ;open the file to start file writing
+  ; keep track of the globals next-node-id, so that after loading the graph, the user can keep creating new nodes following the node id.
+  file-print (word "NEXT " next-node-id)
+  
+  ; start to store node
+  file-print "NODES"
+  
+  ; get all nodes as a list, sorted based on their id.
+  let ns sort-by [[a b] -> [node-id] of a < [node-id] of b] nodes
+  ; write 1 line per node, each line is a list like: [0 415 1392 "building" "Other"]
+  foreach ns [ n ->
+    file-show (list [node-id] of n [xcor] of n [ycor] of n [node-type] of n [building-type] of n)
+  ] ; note: here use file-show because it will write literal value, like "building" instead of building. Other method like file-print does not do so.
+  
+  ; start to store links
+  file-print "LINKS"
+  let ls sort links
+  ; same as above
+  foreach ls [ lk ->
+    file-show (list [node-id] of [end1] of lk
+                    [node-id] of [end2] of lk
+                    [snow?] of lk
+                    [walkability] of lk
+                    [len] of lk)
+  ]
+  file-close
+end
+
+; Observer Context
+; This procedures load a previously saved node-link graph from a text file and rebuild it in the NetLogo world.
+to load-graph [file]
+  let f file
+  ; if f = false [stop]
+  
+  ; Clear existings
+  ask pedestrians [die]
+  ask links [die]
+  ask nodes [die]
+  
+  import-drawing "campus_map.png"
+  file-close-all
+  file-open f
+  
+  ; local var mode is used to determine how to read a specific line based on what it's trying to build.
+  let mode "none" 
+  
+  while [not file-at-end?] [ ; read through file
+    let line file-read-line
+    if length line >= 10 and substring line 0 10 = "observer: " [
+      set line substring line 10 (length line)
+    ]
+    
+    if line = "" [ ]  ; do nothing with empty line
+
+    if line = "NODES" [set mode "nodes"] ; when reach the header, set mode to the specific type.
+    if line = "LINKS" [set mode "links"]
+
+    ; this is for the continuation of next-node-id so that later the user can create new nodes
+    if length line >= 4 and substring line 0 4 = "NEXT" [
+      set next-node-id read-from-string substring line 5 (length line)
+    ]
+    
+
+    ; start reading node
+    ; With file-show, each node line is already a NetLogo-readable list, e.g.: [0 415 1392 "building" "Other"]
+    if mode = "nodes" and line != "NODES" and line != "LINKS"
+    and not ((length line >= 4) and (substring line 0 4 = "NEXT")) [
+      
+      let row read-from-string line   ; row is a list: [id x y node-type building-type]
+      create-nodes 1 [ ; rebuild the node based on what's stored 
+        ; follows the structure of row to get corresponding info for each variable
+        set node-id (item 0 row)
+        setxy (item 1 row) (item 2 row)
+        set node-type (item 3 row)
+        set building-type (item 4 row)
+        
+        set shape "circle"
+        set size default-size
+        ifelse node-type = "building"
+          [set color default-color-building]
+        [set color default-color-road]
+        
+      ]
+    ]
+    
+    ; start reading links
+    ; Link line is also a NetLogo-readable list, e.g.:[0 6 0 0 79.63]
+    if mode = "links" and line != "LINKS" [
+      let row read-from-string line   ; row: [id1 id2 snow? walkability len]
+      let id1 (item 0 row)
+      let id2 (item 1 row)
+      let n1 one-of nodes with [node-id = id1]
+      let n2 one-of nodes with [node-id = id2]
+      ask n1 [
+        create-link-with n2 [
+          set snow? (item 2 row)
+          set walkability (item 3 row)
+          set len (item 4 row)
+          set color yellow
+          set thickness 5
+        ]
+      ]
+    ]
+  ]
+  
+  file-close
+end
+
+; --------------------------------------- Pedestrian Related -----------------------------------------
+; Observer Conetext
+; Generate pedestrians from a random building based on the assigned probability for four types of building.
+; After generated, pedestrians would randomly pick a final destination based on the assigned probability and find the shortest path between where they are born and their destination.
+to generate-pedestrians
+  while [count pedestrians < num-ped] [ ; maintain the total number of pedestrians to a fixed level
+    let origin-type choose-origin-type ; choose building based on the assigned probability
+    ; The reason to create a local variable that tracks the created pedestrian is because the shortest-path procedure is in observer context. It cannot be called in create-pedestrian.
+    ; By creating a local variable in observer context, the shortest-path can be called to find path for the specific pedestrian then get back to pedestrian context.
+    ; It should be noticed that the shortest-path must be in observer context because it calls the external pqueue.nls. There's no space for choices between context for this procedure.
+    let ped nobody
+    create-pedestrians 1 [
+      set size 20
+      set color black
+      let origin one-of nodes with [building-type = origin-type]
+      move-to origin
+      set current-node origin
+      set prev-node origin
+      set final-destination pick-final-destination origin
+      set need-reroute-on nobody
+      ; In case an agent cannot find a destination, this should never happen.
+      if final-destination = nobody [die]
+      set ped self
+    ]
+    ; step out of the pedestrian context to call shortest path
+    let r shortest-path [current-node] of ped [final-destination] of ped
+    ; then step back to assign the path
+    ask ped [
+      set route r
+      set route-index 1
+      set temp-destination item route-index route
+    ]
+  ]
+end
+
+; Observer context
+; The core pedestrians moving logic implementation
+to move-pedestrians
+  ask pedestrians [
+    let lk [link-with [temp-destination] of myself] of current-node ; find the current road it's on
+    let step-speed speed-ped ; the speed varies under different road condition, in normal case without snow, this is just the speed-ped.
+    if [snow?] of lk [
+      set step-speed speed-snow ; if there's snow, set speed to speed-snow
+      if [walkability] of lk > faster-threshold [set step-speed speed-walkable-snow] ; if the walkability is larger the threshold to make a road easier and faster to walk, adjust the speed.
+    ]
+    face temp-destination
+    let d distance temp-destination
+    ifelse d <= step-speed [ ; getting close to the end of the path
+      move-to temp-destination ; directly move to the destination
+      ask lk [set walkability walkability + 1] ; every time a road is walked, its walkability + 1
+      set prev-node current-node ; keep track of its previous node, so that the future choice for pedestrians won't include previous node only they have no other choice.
+      set current-node temp-destination
+      if current-node = final-destination [die] ; if they arrive to their final destination, they will die.
+      ; normal condition without snow
+      set route-index route-index + 1 ; keep track of where pedestrians are at in their shortest path list.
+      set temp-destination item route-index route ; follow the node included in the shortest path
+      if temp-destination = nobody [die] ; a safety logic, should not happen
+      ; After new temp-destination is gotten from their original shortest path list, the pedestrians need to decide whether they want to change their choice of road if they meet snowy road.
+      let next-road ([link-with [temp-destination] of myself] of current-node)
+      if [snow?] of next-road [
+        if random-float 1 < reroute-p-when-snow [ ; under such probability will pedestrian change their route choice
+          let nbrs ([link-neighbors] of current-node) with [self != [prev-node] of myself]
+          ; The overall logic here is that if a pedestrian wants to change their route choice due to the snow, they will choose the one that is most walkable.
+          ; If there's more than one most walkable route, choose the one closer their final destination.
+          if any? nbrs [
+            ; first, find a neighbor with highest walkability
+            let best-nbr max-one-of nbrs [[walkability] of (link-with [current-node] of myself)]
+            ; then, use best-walk to store this highest walkability
+            let best-walk [walkability] of ([link-with best-nbr] of current-node)
+            ; find all neighbors with the highest-walkability
+            let bests nbrs with [[walkability] of (link-with [current-node] of myself) = best-walk]
+            ; choose the one that is closest to the final destination
+            let best-candidate min-one-of bests [distance [final-destination] of myself]
+            
+            if [walkability] of next-road != best-walk [; if equal, then no need to reroute because the shortest path is already with the highest walkability.
+              set need-reroute-on best-candidate ; if one decides to reroute and there's more walkable route than the original one, set need-reroute-on to be the best-candidate
+            ]
+          ]
+        ]
+      ]
+    ][
+      fd step-speed ; if the pedestrian has gotten close to its temp-destination, just keep moving.
+    ]
+  ]
+  ; It should be specified here about why the variable need-reroute-on is necessary: the fundamental reason is the same as what happens in generate-pedestrian. The shortest-path procedure is and 
+  ; must be in observer context, so we must step out the pedestrian context of ask pedestrians to actually call shortest-path. However, if we step out of ask pedestrians, we will lose track of which
+  ; pedestrian we were dealing with, and creating local variables like the way in generate-pedestrian won't work because ask pedestrians call multiple of them rather a single of them. As a result, I
+  ; had to create a pedestrian variable to keep track of which pedestrian need reroute and where they need reroute. If need-reroute-on is nobody, it means the pedestrian does not need to reroute. 
+  ; Otherwise, the need-reroute-on will store on which node they want to reroute, so that we can call the procedure finding shortest path between their final destination and the node.
+  while [any? pedestrians with [need-reroute-on != nobody]] [
+    let ped one-of pedestrians with [need-reroute-on != nobody]
+    let new-route shortest-path ([need-reroute-on] of ped) ([final-destination] of ped) ; call shortest-path to find new route
+    ask ped [ ; step back to pedestrian context to assign the new route
+      set route fput current-node new-route
+      set route-index 1
+      set temp-destination item route-index route
+      set need-reroute-on nobody
+    ]
+  ]
+end
+
+; ---------------------------- Tools for initiating pedestrians and planning movement -------------------
+
+; for generate-pedestrians, choose what types of building as origin
+to-report choose-origin-type
+  report weighted-choice
+    ["Academic" "Dining" "Residential" "Other"]
+    (list p-origin-academic p-origin-dining p-origin-residential p-origin-other)
+end
+
+; for generate-pedestrians, choose what types of building as final destination
+to-report choose-dest-type
+  report weighted-choice
+    ["Academic" "Dining" "Residential" "Other"]
+    (list p-dest-academic p-dest-dining p-dest-residential p-dest-other)
+end
+
+; a helper to make stochastic choice based on weighted probability
+to-report weighted-choice [labels weights]
+  let total sum weights
+  let r random-float total
+  let acc 0
+  ; use anonymous reporter
+  (foreach labels weights [ [lab w] ->
+    set acc acc + w
+    if r <= acc [ report lab ]
+  ])
+end
+
+; the reporter to pick a final destination after being born on a building node
+to-report pick-final-destination [origin-node]
+  let dest-type choose-dest-type
+  let candidates nodes with [
+    node-type = "building" and ; make sure to choose a building node rather than road node
+    building-type = dest-type and
+    self != origin-node  ; make sure to not select where they are born
+  ]
+  if not any? candidates [ ; safety case, should not happen with the complete-graph provided
+    set candidates nodes with [node-type = "building" and self != origin-node]
+  ]
+  if not any? candidates [ report nobody ]
+  report one-of candidates
+end
+
+; Observer Context
+; The implementation of Djikstra's Algorithm for finding the shortest path between two nodes with weighted path, which is the distance of path in this case.
+to-report shortest-path [start dest]
+  ask nodes [
+    set acc_dist 1.0E18 ; set to infinity
+    set parent nobody ; no predecessor yet
+    set pq-pos -1 ; not in priority queue yet
+  ]
+  ask start [set acc_dist 0] ; the distance to starting node is 0.
+  ; create a new priority queue
+  let pq-ct  [ [?1 ?2] -> [acc_dist] of ?1 < [acc_dist] of ?2 ]
+  let pq-upt [ [?1 ?2] -> ask ?1 [ set pq-pos ?2 ] ]
+  let q pq-new pq-ct pq-upt
+  ; insert first node into pq
+  pq-insert q start
+  ; main loop, keep inserting and taking out from pq
+  while [not pq-empty? q][
+    let cur pq-delete-front q ; each time take out the topest node in pq
+    ask cur [set pq-pos -1] ; remove it from the priority queue
+    if cur = dest [ ; found the final destination
+      report reconstruct-path start dest ; then start to collect nodes of the shortest path into a list
+    ]
+    ask cur [
+      ask link-neighbors [
+        let w [len] of link-with cur ; the weight of path is link length, representing the distance between node
+        let alternative ([acc_dist] of cur) + w
+        ; if a shorter path is found, update the node in the prioerity queue
+        if alternative < acc_dist [
+          set acc_dist alternative
+          set parent cur
+          let pos pq-pos
+          ifelse pos >= 0 [
+            ask q [pq-bubble pos] ; update position in pq if already in it
+          ][
+            pq-insert q self ; otherwise put itself into the pq
+          ]
+        ]
+      ]
+    ]
+  ]
+  report [] ; safety case for unreachable destination, won't happen with the provided complete-graph
+end
+
+; the core function for the Dijkstra's Algorithm to find the list of nodes in shortest path
+to-report reconstruct-path [start dest]
+  let p (list dest)
+  let cur dest ; starting from the end
+  while [cur != start][ ; keep moving back until find the starting point.
+    set cur [parent] of cur
+    set p fput cur p
+  ]
+  report p
+end
+  
+; ---------------------------------- Plow Related ------------------------------------------
+; Observer Context
+; create plow on a random node (including road node) if required
+to generate-plow
+  create-plows num-plow [
+    set size 25
+    set color red
+    set shape "square"
+    set current-node one-of nodes
+    move-to current-node
+    set temp-destination nobody
+  ]
+end
+
+; Observer Context
+; The implementation of the moving logic and strategies of snow plow.
+to move-plow
+  ask plows [
+    ifelse temp-destination = nobody [ ; when the plow has arrived a node and wait to plan for the next path
+      let nbrs [link-neighbors] of current-node
+      if any? nbrs [
+        let snowy nbrs with [[snow?] of (link-with [current-node] of myself)] ; always first find any snowy path to go
+        ifelse any? snowy [ ; if there are multiple snowy roads, that's where the plow strategies come in.
+          if plow-strategy = "clean-more-walked" [
+            set temp-destination max-one-of snowy [[walkability] of (link-with [current-node] of myself)] ; choose the snowy condition with highest walkability
+          ]
+          if plow-strategy = "clean-less-walked" [
+            set temp-destination min-one-of snowy [[walkability] of (link-with [current-node] of myself)] ; choose the snowy condition with lowest walkability
+          ]
+        ][
+          set temp-destination one-of nbrs ; if no any snowy path, move to a random node.
+        ]
+    ]][
+      face temp-destination
+      let d distance temp-destination
+      ifelse d <= speed-plow [
+        let old current-node
+        move-to temp-destination
+        ask old [ ; when it completely passes a road, set snow? false representing it removes the snow on the path.
+          let lk link-with [temp-destination] of myself
+          ask lk [set snow? false set color yellow] 
+        ]
+        
+        set current-node temp-destination
+        set temp-destination nobody
+      ] [
+        fd speed-plow
+      ]
+    ]
+  ]
+end
+
+; ------------------- Visualization ----------------------
+; To visually represent which path is walked more on the graph. The more black a path is, the more walked it is.
+to update-link-visual
+  let maxW max [walkability] of links
+  ask links [
+    let ratio 0
+    if maxW != 0 [
+    set ratio walkability / maxW
+    ]
+    set color ((1 - ratio) * 9.9)
+  ]
+end]]></code>
+  <widgets>
+    <view x="455" wrappingAllowedX="true" y="12" frameRate="30.0" minPycor="0" height="905" showTickCounter="true" patchSize="0.5" fontSize="10" wrappingAllowedY="true" width="873" tickCounterLabel="ticks" maxPycor="1799" updateMode="0" maxPxcor="1737" minPxcor="0"></view>
+    <chooser x="292" y="772" height="61" variable="building-type-to-make" current="3" width="143" display="building-type-to-make">
+      <choice type="string" value="Academic"></choice>
+      <choice type="string" value="Dining"></choice>
+      <choice type="string" value="Residential"></choice>
+      <choice type="string" value="Other"></choice>
+    </chooser>
+    <button x="28" y="739" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="83">save-graph</button>
+    <button x="17" actionKey="S" y="789" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="121">make-building-node</button>
+    <button x="18" actionKey="Q" y="842" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="95">make-path</button>
+    <button x="125" y="842" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="103">delete-path</button>
+    <button x="245" actionKey="W" y="842" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="107">delete-node</button>
+    <button x="153" actionKey="A" y="789" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="125">make-road-node</button>
+    <switch x="39" y="112" height="40" on="false" variable="snowed?" width="83" display="snowed?"></switch>
+    <button x="36" y="61" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55">go</button>
+    <button x="95" y="61" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="112" display="reset-simulation">reset-simulation
+  </button>
+    <switch x="268" y="60" height="40" on="false" variable="show-walkability?" width="135" display="show-walkability?"></switch>
+    <switch x="127" y="111" height="40" on="false" variable="snow-plow?" width="109" display="snow-plow?"></switch>
+    <slider x="41" step="1" y="178" max="200" width="347" display="num-ped" height="50" min="0" direction="Horizontal" default="100.0" variable="num-ped"></slider>
+    <slider x="44" step="1" y="607" max="30" width="345" display="speed-plow" height="50" min="0" direction="Horizontal" default="15.0" variable="speed-plow"></slider>
+    <slider x="42" step="0.1" y="480" max="1" width="346" display="reroute-p-when-snow" height="50" min="0" direction="Horizontal" default="0.3" variable="reroute-p-when-snow"></slider>
+    <slider x="41" step="1" y="417" max="20" width="348" display="speed-walkable-snow" height="50" min="0" direction="Horizontal" default="7.0" variable="speed-walkable-snow"></slider>
+    <slider x="40" step="1" y="355" max="20" width="348" display="speed-snow" height="50" min="0" direction="Horizontal" default="5.0" variable="speed-snow"></slider>
+    <slider x="40" step="1" y="295" max="20" width="345" display="speed-ped" height="50" min="0" direction="Horizontal" default="10.0" variable="speed-ped"></slider>
+    <slider x="41" step="1" y="237" max="10" width="345" display="num-plow" height="50" min="0" direction="Horizontal" default="1.0" variable="num-plow"></slider>
+    <chooser x="245" y="111" height="60" variable="plow-strategy" current="1" width="156" display="plow-strategy">
+      <choice type="string" value="clean-more-walked"></choice>
+      <choice type="string" value="clean-less-walked"></choice>
+    </chooser>
+    <plot x="1346" autoPlotX="true" yMax="10.0" autoPlotY="true" y="150" xMin="0.0" height="228" legend="false" xMax="10.0" yMin="0.0" width="285" display="Average Walking Time">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="default" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot average-walking-time</update>
+      </pen>
+    </plot>
+    <button x="147" y="739" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="73" display="load-graph">load-graph user-file</button>
+    <slider x="42" step="1" y="542" max="1000" width="345" display="faster-threshold" height="50" min="0" direction="Horizontal" default="200.0" variable="faster-threshold"></slider>
+    <button x="210" y="61" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55">setup</button>
+  </widgets>
+  <info><![CDATA[# WHAT IS IT?
+
+This is an agent-based model aiming to simulate pedestrian movements on a campus setting road network under winter conditions. It explores how pedestrian route choice behavior forms the pattern of roads walkability, and how the pattern can be changed with snowy road condition and snow-plow clearing strategies.
+
+Pedestrians move between campus buildings along a predefine node-link graph representing the campus network with buildings and roads. Under winter conditions, roads become harder to be walked on, but repeated pedestrians use can increase their walkability. Pedestrians may probabilistically deviate from their shortest path to seek for more walkable routes. Meanwhile, the appearance of snow plow into the network that cleans the snow of roads add even more complexity into the pattern. The patterns of roads walkability and pedestrians average walking time to reach destination can be investigated under various conditions and plow strategies. This model is designed to study how local decentralized decisions by pedestrians and snow plows can affect the system-level emergent outcomes such as the change in walking time and spatial patterns of road usage.
+
+# HOW IT WORKS
+
+## Overview
+Goal: Simulating the patterns of pedestrian movement under winter condition; observe patterns changing with snow and plow strategies.
+
+Agent types:
+-- Node: Turtles that are not do not make any decision themselves. There are building nodes and road nodes, consisting of the node-link graph. Building nodes have four different types: Academic, Dining, Residential, and Other. Nodes are used as origin and destination for pedestrians, which are selected based on an assigned probability
+-- Pedestrians: Agents making autonomous decisions for their movement behavior based on local environment. Pedestrians share the same speed when walking on the same road condition. They have variables tracking their final/temporary destination and their shortest path.
+-- Snow Plow: Agents making autonomous decisions based on thier cleaning strategies for their movement behavior. Snow plow is randomly generated any where on the graph. They follow a specific strategy to move between nodes.
+
+Variables:
+-- num-ped: Number of pedestrians in the model
+-- num-plow: Number of plows in the model
+-- speed-ped: the speed of pedestrians movement under normal condition
+-- speed-snow: the speed of pedestrians movement under snowy road condition
+-- speed-walkable-snow: the speed of pedestrians movement under snowy but more walkable condtion (road with walkability higher than a defined threshold)
+-- reroute-p-when-snow: the probability for pedestrians to change their routing and find a more walkable route when meeting snowy road
+-- faster-threshold: the threshold of walkability for a road to be with snowy but more walkable condition
+-- speed-plow: the speed of plow movement
+
+Behaviors:
+Generation of Agents -- Each tick new pedestrian may be generated if the number of existing pedestrian is lower than the defined value.
+
+Movement -- Each tick pedestrians will move toward its targeted node in a certain speed. Plow will also move in a given speed to a selected node.
+
+Route Planning: The origin and final destination are confirmed once a pedestrian is born. Then the pedestrian will use the Dijkstra's Algorithm to search for the shortest path between their origin and final destination and follow the path to move. The principle behind this idea of pedestrians knowing the shortest path is that in a campus setting, pedestrians are mostly students, faculties, staffs who are very familiar with the road network. Unlike some case in urban setting where pedestrians may not know anything about the road network, they live in the network for a long time to know the shortest path between buildings. Therefore, pedestrians in campus setting will follow the shortest path to walk unless other factors like snowy condition motivates them to change to a more walkable road.
+
+Reroute: When pedestrians meet a snowy road, they may probablistically choose to walk on another road with higher walkability. Specifically, once they decide to move to a more walkable road, they will look at all available choices and find the most walkable roads. If more than one most walkable roads exist, they will choose the one closer to their destination. If no more walkable option exist, they will still follow their original path.
+
+Plow Strategy: A general principle is followed by plow under any strategy, which is to choose a path with snow over path without snow. clean-more-walked strategy instructs plow to choose a snowy path that is walked the most (wit higher walkability). clean-less-walked strategy instructs plow to pick a snowy path that is walked the least (with lower walkability).
+
+Spatial-Temporal Scale:
+The spatial scale is fixed to the campus scale. The temporal scale is around second to minute level. In fact, the temporal scale can be changed by adjusting the speed of pedestrian. The higher the speed pedestrians have, the larger the temporal scale is. At the default level, with a around 60 ticks average-walking time, assuming that the real-world average walking time is 10 minutes, then the temporal scale can be around 10 seconds.
+
+Process and Scheduling
+Each tick pedestrians and plows will decide on where they move and then move. It should be noticed that plows will be only generated after 2000 ticks. This is to make sure that the original pedestrian moving patterns are formed, then introducing plows to see how it can change the pattern of pedestrians movement. Whenever the number of existing pedestrians is lower than the set value, new pedestrians will be generated.
+
+## Design Concepts
+
+-- Emergence
+This model focuses on how system-level patterns emerge from many local decisions. Individual pedestrians only respond to their immediate road conditions, and no system-level patterns are explicitly modeled or described. Snow plow also follows simple strategies to determine where to go and clean snow. The emergent patterns arise from the interactions between pedestrians and plows decisions.
+
+-- Stochasticity
+Stochastic elements are incoporated at several stages of model. Pedestrians are generated from buildings based on probablistic origin and destination selection. When encountering snowy roads, pedestrians probablistically decide whether to reroute. Snow plow also randomly select road to follow when there are multiple qualifying path available. Interestingly, even with many stochasticity involved in the model, the emergent patterns of pedestrian movement tend to be similar in multiple runs, revealing the fascinating relationship between stochasticity and emergence.
+
+-- Adaptation
+Pedestrians adapt their movement behavior based on local road conditions. When snow is present, they may abandon their original shortest path and choose more walkable roads and reroute based on their decision. Another indirect adaptation is that repeated pedestrian usage increases a road's walkability, making it more attractive for future pedestrians. Therefore, future pedestrians movement may adapt to how current pedestrians move.
+
+## Details
+-- Initialization
+Some parameters, including number of pedestrian, number of plow can be set to any value based on what user want to see. Parameters including pedestrian speed under various conditions, probability to reroute, threshold of walkability to make road faster to be walked are based on studies and developer's judgement.
+
+The complete graph of nodes and links is draw by developer manually. There is simplification that exludes some nodes and path on campus.
+
+# HOW TO USE IT
+
+Press setup and go to run a simulation. Adjust sliders, choosers, and switches to change simulation setting, then press reset-simulation and go to run another simulation.
+
+Basic operation:
+-- press setup to import image and graph. The image and complete-graph should be correctly imported directly by pressing setup. If the setup fails to do so, like the graph is not imported, user can press the load-graph button to import by themselves.
+
+-- go: run the simulation
+
+-- reset-simulation: whenever user wants to change the variable setting, they can move the slider then press reset-simulation to setup simulation without reimport image and graph.
+
+-- snowed?: this switch controls whether the simulation is runned under snowed condition.
+
+-- snow-plow?: this switch controls whether to implement snow plow, the number of snow plow to be implemented can be controled by the num-plow slider.
+
+-- show-walkability?: this switch controls the visualization of graph. If the switch is on, the links in the graph will be displayed based on their relative walkability. The more a road is walked, the more black the link will be. When the switch is off the graph will be in normal display.
+
+-- plow-strategy: user can choose different strategy for snow plow to move and observe how their strategies can affect pedestrians moving patterns.
+
+Funtion that may not be necessarily used:
+These buttons may only be used if user wants to create graph by themselves.
+
+make-building-node: use mouse to press any part of the image to create a building node.
+
+building-type-to-make: this chooser determine which building type will be made when a building node is created.
+
+making-road-node: use mouse to press any part of the image to create a road node.
+
+make-path: use mouse to select two nodes, a path link will be created between them.
+
+delete-path: use mouse to select two nodes, the path between them will be deleted.
+
+delete-node: use mouse select and delete a node.
+
+save-graph: save your own graph to an external file
+
+load-graph: import graph from an external file
+
+
+# THINGS TO NOTICE
+
+The average-walking-time monitor keeps tracks of how the average walking time of pedestrians varies. User can observe how this value change over time and under different simulation settings to get a general understanding about how the pedestrians patterns are changed by different conditions and plow strategies.
+
+Switch on show-probability?, user can directly observe which paths are walked more on the graph. Find out how patterns are specifically changes at certain locations under different simulation settings.
+
+In a fixed setting, the patterns of pedestrian movement is relatively stable between ticks and between runs, even with stochastic elements involved.
+
+There are some intuitive and unintuitive changes in average-walking-time and direct visual patterns that can be observed by changing simulation settings.
+
+# THINGS TO TRY
+
+Try switch on/off snow? and snow-plow? to observe how patterns of pedestrian movement change under different conditions.
+
+Select different plow strategies to see how the patterns of pedestrian movement are changed.
+
+Alter the reroute-p-when-snow to see how this probability can affect the entire patterns. Is higher reroute-p-when-snow better or not in terms of average-walking-time? Under what settings for other variables?
+
+Alter the faster-threshold to see how the threshold of walkability to make a road easier to be walked can affect the overall patterns.
+
+Add more snow-plow to see whether it helps to lower average-walking-time or not.
+
+Try different speed combinations, observe how the direct visuals of walkability patterns (with show-walkability? on) changes.
+
+# EXTENDING THE MODEL
+
+More plow strategies can be developed to find more effective way of cleaning snow to lower pedestrians moving time. The interface for plow strategies selection is set to be a chooser for extension purpose. Future user can develop their own strategy and simply add to the chooser to switch between strategies.
+
+A daytime logic can be incorporated. The distributions of origin and final destination of pedestrians can vary in different time of a day. For example, at 12pm and 6pm, people may tend to walk to and from dining buildings.
+
+A snowing condition can be added. Now the model only has snowed condition, which means when snow-plow clean the snow on a road, it won't be snowy again. In snowing condition, road can become snowy again after a certain period of time, making the simulation more realistic.
+
+# NETLOGO FEATURES
+
+-- External file writing, saving and loading. 
+
+-- Include source file: pqueue.nls is included as a source file for the code.
+
+-- Import drawing: import-drawing is used to import image as background
+
+-- Behavior space is used for experiementation. An experiment on testing the effectiveness of snow plow strategies was conducted.
+
+-- Interface with chooser, switch, monitor, button, etc.
+
+# RELATED MODELS
+
+Netlogo Lib: Traffic Models -- Traffic Basic, Traffic Grid, etc.
+MiddTraffic Model implemented in class.
+
+# CREDITS AND REFERENCES
+
+Jin, L., Lu, W., & Sun, P. (2022). Preference for street environment based on route choice behavior while walking. Frontiers in Public Health, 10, 880251.
+This paper helps me to understand whether and under what condition pedestrians would change their original routing plan. I followed some of its description to build the decision logic for pedestrians to choose a more walkable road
+
+Fossum, M., & Ryeng, E. O. (2022). Pedestrians’ and bicyclists’ route choice during winter conditions. Urban, planning and transport research, 10(1), 38-57.
+This paper helps me to determine the default probability of reroute-p-when-snow, as its survey shows how many people may choose to reroute when they meet snowy conditions.
+
+Liang, S., Leng, H., Yuan, Q., Wang, B., & Yuan, C. (2020). How does weather and climate affect pedestrian walking speed during cool and cold seasons in severely cold areas?. Building and environment, 175, 106811.
+This paper makes me believe that it is legitimate to think that climate and road condition would change pedestrian moving speed and behaviors.
+
+Ma, L., Brandt, S. A., Seipel, S., & Ma, D. (2024). Simple agents–complex emergent path systems: Agent-based modelling of pedestrian movement. Environment and planning B: Urban analytics and city science, 51(2), 479-495.
+This research does not directly support any setup in my model, but it did make me realize that pedestrian movements can itself be a field to work with agent-based model, guiding my direction to decide what to work on for my term project.
+
+In class file: 
+MiddTraffic: this model inspired to me about how to implement pedestrian movements on a map. My idea of drawing nodes and links to abstractize map comes from this model.
+pqueue.nls: the implementation of priority queue is from this file delievered as part of the alaska island model.
+
+
+# Responsible Computing
+This agent-based model is designed not only as a technical simulation of pedestrian movement but also a simplified representation of how individual decisions (shortest path and reroute), environmental constraints (walkability and snow), and institutional interventions (snow plow with different strategies) interact in shared public spaces. The model highlights how computational tools can be used to explore complex emergent dynamics in spatial explicit systems, while raising questions about assumptions, limitations, and ethical implications.
+
+An important social impact of the model is that it focuses on pedestrians' individual experiences to understand the patterns of overall movement. Rather than directly generating a system-level patterns with mathematical equations, such a way of describing movement patterns can be more realistic and pedestrians benefits driven. By centering pedestrians as agents with limited speed, vulnerability to weather, and imperfect decision-making, the model encourages thinking about walkability, accessibility, and equity in campus and urban design. It demonstrates that how campus issues like poor maintenance of pedestrians infrastructure and inefficient snow-plow assignment and strategies can disproportionally increase walking time and reduce mobility, which in real-world affects individuals with disabilities, injuries, and time constraints.
+
+With real-world data incorporated into the model, it can be used to provide insights on changing campus design, such as add more roads at more concentrated area. Also, institutional interventions and resource allocations can become more efficient with optimized by simulations. This is a low-cost method to improve campus design without taking the risks of causing issues in the real world.
+
+However, at the same time, the user of the model must clearly realize the limitations of the model. First, pedestrians in the model are assumed to have perfect knowledge about the shortest path between buildings, which is unrealistic even in campus setting. Also, the number of pedestrians on campus is not fixed as what is determined in the model. The homogeneity across agents, where they all share similar logic of decision and speed, is highly unrealistic. The actual pedestrians movement decisions are much more complex that no model can accurately model, with various factors, including safety, lighting, crowding, personal preferences, or physical ability. These simplifications mean that the model should not be used for direct policy recommendations without careful validation and extension. 
+
+It should be understood that the limitations of the model do not mean that it is completely useless. Instead, the insights and perspectives it provides are unique and valuable, but only when the user clearly realize the potential biases and assumptions within the model. Agent-based models can create compelling visualizations and numerical outputs that appear authoritative and objective. Without transparency about assumptions and limitations, such models can be misused to justify infrastructure decisions that overlook qualitative human experiences. Responsible computing therefore requires detailed documentation, openness about design choices, and realization of what the model can or cannot explain.
+
+
+
+]]></info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="experiment" repetitions="10" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="5000">
+      <setup>reset-simulation</setup>
+      <go>go</go>
+      <runMetricsCondition>ticks mod 1000 = 0</runMetricsCondition>
+      <metrics>
+        <metric>(sum [walking-time] of pedestrians) / num-ped</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-ped">
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-plow">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="building-type-to-make">
+          <value value="&quot;Other&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="show-walkability?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snow-plow?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="speed-snow">
+          <value value="1"></value>
+          <value value="3"></value>
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="speed-plow">
+          <value value="15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snowed?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="speed-ped">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="speed-walkable-snow">
+          <value value="5"></value>
+          <value value="7"></value>
+          <value value="9"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reroute-p-when-snow">
+          <value value="0.3"></value>
+          <value value="0.5"></value>
+          <value value="0.7"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="faster-threshold">
+          <value value="200"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="plow-stategy-effectiveness" repetitions="5" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="10000">
+      <setup>setup
+reset-simulation</setup>
+      <go>go</go>
+      <runMetricsCondition>ticks mod 1000 = 0</runMetricsCondition>
+      <metrics>
+        <metric>average-walking-time</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-ped">
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-plow">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="building-type-to-make">
+          <value value="&quot;Other&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="show-walkability?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snow-plow?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="speed-snow">
+          <value value="1"></value>
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="speed-plow">
+          <value value="15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snowed?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="speed-ped">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="plow-strategy">
+          <value value="&quot;clean-less-walked&quot;"></value>
+          <value value="&quot;clean-more-walked&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="speed-walkable-snow">
+          <value value="5"></value>
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reroute-p-when-snow">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="faster-threshold">
+          <value value="10"></value>
+          <value value="100"></value>
+          <value value="500"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
